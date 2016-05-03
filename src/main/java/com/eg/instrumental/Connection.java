@@ -2,28 +2,29 @@ package com.eg.instrumental;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.InputStreamReader;
+import java.io.BufferedReader;
+import java.lang.NullPointerException;
 import java.lang.management.ManagementFactory;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.Charset;
-import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Logger;
 
-/**
- * Created by bvarner on 12/17/14.
- */
-public final class Collector implements Runnable {
+public final class Connection implements Runnable {
 
 	private static final Charset ASCII = Charset.forName("ASCII");
-	private static final ThreadFactory collectorThreadFactory = new CollectorThreadFactory();
+	private static final ThreadFactory connectionThreadFactory = new ConnectionThreadFactory();
 
-	private String apiKey;
-	LinkedBlockingDeque<Metric> messages = new LinkedBlockingDeque<Metric>(5000);
+	private AgentOptions agentOptions;
+	public static final int MAX_QUEUE_SIZE = 5000;
+	LinkedBlockingQueue<String> messages = new LinkedBlockingQueue<String>(MAX_QUEUE_SIZE);
 	private Thread worker = null;
 	private Socket socket = null;
 	OutputStream outputStream = null;
@@ -39,35 +40,19 @@ public final class Collector implements Runnable {
 	private long reconnectBackoff = 2;
 
 
-	private static final Logger LOG = Logger.getLogger(Collector.class.getName());
+	private static final Logger LOG = Logger.getLogger(Connection.class.getName());
 
-	public Collector(final String apiKey) {
-		this.apiKey = apiKey;
+	public Connection(final AgentOptions agentOptions) {
+		this.agentOptions = agentOptions;
 	}
 
-
-
-	public void setApiKey(final String apiKey) {
-		streamLock.lock();
-		cleanupStream();
-		this.apiKey = apiKey;
-		try {
-			ensureStream();
-		} catch (IOException ioe) {
-			LOG.warning("Connection Error.");
-		} finally {
-			streamLock.unlock();
-		}
+	public AgentOptions getAgentOptions() {
+		return agentOptions;
 	}
 
-	public String getApiKey() {
-		return apiKey;
-	}
-
-
-	void send(Metric metric, boolean synchronous) {
+	void send(String command, boolean synchronous) {
 		if (worker == null || !worker.isAlive()) {
-			worker = collectorThreadFactory.newThread(this);
+			worker = connectionThreadFactory.newThread(this);
 			worker.start();
 		}
 
@@ -77,7 +62,7 @@ public final class Collector implements Runnable {
 				streamLock.lock();
 				try {
 					ensureStream();
-					write(metric, true);
+					write(command, true);
 					success = true;
 				} catch (IOException ioe) {
 					cleanupStream();
@@ -90,14 +75,14 @@ public final class Collector implements Runnable {
 					}
 				} catch (IllegalArgumentException iae) {
 					LOG.severe(iae.toString());
-					send(Metric.increment("agent.invalid_metric"), false);
+					send(new Metric(Metric.Type.INCREMENT, "agent.invalid_metric", 1, System.currentTimeMillis(), 1).toString(), false);
 				} finally {
 					streamLock.unlock();
 				}
 			} while (!success);
 		} else {
 			try {
-				messages.add(metric);
+				messages.add(command);
 				queueFullWarned = false;
 			} catch (IllegalStateException ise) {
 				if (!queueFullWarned) {
@@ -110,7 +95,6 @@ public final class Collector implements Runnable {
 
 	@Override
 	public void run() {
-		Metric metric = null;
 		while (!shutdown || !messages.isEmpty()) {
 			// Make sure the socket state is kosher.
 			try {
@@ -121,13 +105,10 @@ public final class Collector implements Runnable {
 
 			// Get the next message off the queue.
 			try {
-				if (metric == null) {
-					metric = messages.poll(5, TimeUnit.SECONDS);
-				}
+				String command = messages.take();
 
 				// Try to write the message
-				write(metric, false);
-				metric = null;
+				write(command, false);
 			} catch (InterruptedException ie) {
 				break;
 			} catch (IOException ioe) {
@@ -138,10 +119,9 @@ public final class Collector implements Runnable {
 					break;
 				}
 			} catch (IllegalArgumentException iae) {
-				// Illegally formatted metric.
+				// Illegally formatted command.
 				LOG.severe(iae.toString());
-				metric = null;
-				send(Metric.increment("agent.invalid_metric"), false);
+				send(new Metric(Metric.Type.INCREMENT, "agent.invalid_metric", 1, System.currentTimeMillis(), 1).toString(), false);
 			}
 		}
 	}
@@ -149,21 +129,41 @@ public final class Collector implements Runnable {
 	private void ensureStream() throws IOException {
 		streamLock.lock();
 		try {
-			while (outputStream == null && !shutdown) {
+			while (!shutdown) {
 				socket = new Socket();
 				socket.setTcpNoDelay(true);
 				socket.setKeepAlive(true);
 				socket.setTrafficClass(0x04 | 0x10); // Reliability, low-delay
 				socket.setPerformancePreferences(0, 2, 1); // latency more important than bandwidth and connection time.
-				socket.connect(new InetSocketAddress("collector.instrumentalapp.com", 8000));
+				socket.connect(new InetSocketAddress(agentOptions.getHost(), agentOptions.getPort()));
 				outputStream = socket.getOutputStream();
 
 				String hello = "hello version java/instrumental_agent/0.0.1 hostname " + getHostname() + " pid " + getProcessId("?") + " runtime " + getRuntimeInfo() + " platform " + getPlatformInfo();
 
 				write(hello, true);
-				write("authenticate " + apiKey, true);
+				write("authenticate " + agentOptions.getApiKey(), true);
 
-				errors = 0;
+				socket.setSoTimeout(6000);
+				try {
+					BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+					if (reader.readLine().equals("ok")) {
+						if (reader.readLine().equals("ok")) {
+							errors = 0;
+							break;
+						} else {
+							LOG.severe("authentication failed");
+						}
+					} else {
+						LOG.severe("hello failed");
+					}
+				} catch (NullPointerException e) {
+					// Raised on disconnect, no action required
+				}
+
+				try {
+					backoffReconnect();
+				} catch (InterruptedException ie) {
+				}
 			}
 		} finally {
 			streamLock.unlock();
@@ -238,6 +238,10 @@ public final class Collector implements Runnable {
 		return worker != null && worker.isAlive();
 	}
 
+		public boolean isQueueOverflowing() {
+				return queueFullWarned;
+		}
+
 	public void setShutdown(boolean shutdown) {
 		this.shutdown = shutdown;
 
@@ -247,7 +251,7 @@ public final class Collector implements Runnable {
 				try {
 					worker.join(10000);
 				} catch (InterruptedException ie) {
-					LOG.severe("Failed to cleanly shutdown the Collector");
+					LOG.severe("Failed to cleanly shutdown the Connection");
 				}
 			}
 			streamLock.lock();
@@ -263,19 +267,14 @@ public final class Collector implements Runnable {
 		// An error occurred trying to send the current message.
 		// Do a reconnect, then try to send the message again.
 		// Since we've removed the message from the queue, don't discard it, and don't advance.
-		errors++;
-		long delay = (long) Math.min(maxReconnectDelay, Math.pow(errors++, reconnectBackoff));
-		LOG.severe("Failed to connect to collector.instrumentalapp.com:8000. Retry in " + delay + "ms");
+		long delay = (long) Math.min(maxReconnectDelay, Math.pow(errors++, reconnectBackoff) * 1000);
+		LOG.severe("Failed to connect to " + agentOptions.getHost() + ":" + agentOptions.getPort() + ". Retry in " + delay + "ms");
 		Thread.sleep(delay);
-	}
-
-	private void write(Metric metric, boolean forceFlush) throws IOException, IllegalArgumentException {
-		write(metric.toString(), forceFlush);
 	}
 
 	private void write(String message, boolean forceFlush) throws IOException {
 		// If we 'shutdown', don't do anything
-		if (!shutdown) {
+		if ((!shutdown) && (message != null)) {
 			try {
 				streamLock.lockInterruptibly();
 
@@ -292,8 +291,6 @@ public final class Collector implements Runnable {
 						outputStream.flush();
 						bytesWritten = 0;
 					}
-
-					errors = 0;
 				} finally {
 					streamLock.unlock();
 				}
@@ -306,14 +303,14 @@ public final class Collector implements Runnable {
 	/**
 	 * Internal class to create the background threads.
 	 */
-	private static class CollectorThreadFactory implements ThreadFactory {
+	private static class ConnectionThreadFactory implements ThreadFactory {
 		private static ThreadGroup agentThreads = new ThreadGroup("Instrumental-Agent");
 		private static final AtomicInteger threadCount = new AtomicInteger(0);
 
 		@Override
 		public Thread newThread(Runnable r) {
-			Thread t = new Thread(agentThreads, r, "collector-" + threadCount.getAndIncrement());
-			t.setDaemon(false);
+			Thread t = new Thread(agentThreads, r, "connection-" + threadCount.getAndIncrement());
+			t.setDaemon(true);
 			t.setPriority(Thread.MIN_PRIORITY + 1);
 			return t;
 		}

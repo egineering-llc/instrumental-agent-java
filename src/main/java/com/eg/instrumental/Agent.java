@@ -9,55 +9,63 @@ import java.util.concurrent.Future;
  * // TODO: Add JMX Exporting...
  */
 public class Agent {
+	private AgentOptions agentOptions;
+	private Connection connection;
 
-	private boolean synchronous = false;
-
-	private Collector collector;
+	public Agent(final AgentOptions agentOptions) {
+		this.agentOptions = agentOptions;
+		initializeConnection();
+	}
 
 	public Agent(final String apiKey) {
-		collector = new Collector(apiKey);
+		this.agentOptions = new AgentOptions();
+		agentOptions.setApiKey(apiKey);
+		initializeConnection();
+	}
+
+	private void initializeConnection() {
+		if (agentOptions.getEnabled()) {
+			connection = new Connection(agentOptions);
+		}
 	}
 
 	@Override
 	protected void finalize() throws Throwable {
-		collector.setShutdown(true);
-	}
-
-	public String getApiKey() {
-		return collector.getApiKey();
-	}
-
-	public void setApiKey(final String apiKey) {
-		collector.setApiKey(apiKey);
+		if (agentOptions.getEnabled()) {
+			connection.setShutdown(true);
+		}
 	}
 
 	public boolean isRunning() {
-		return collector.isRunning();
+		return agentOptions.getEnabled() && connection.isRunning();
 	}
 
 	public boolean getShutdown() {
-		return collector.isShutdown();
+		return !agentOptions.getEnabled() || connection.isShutdown();
 	}
 
 	public void setShutdown(boolean shutdown) {
-		collector.setShutdown(shutdown);
-	}
-
-	public boolean getSynchronous() {
-		return synchronous;
+		if (agentOptions.getEnabled()) {
+			connection.setShutdown(shutdown);
+		}
 	}
 
 	public int getPending() {
-		return collector.messages.size();
+		if (agentOptions.getEnabled()) {
+			return 0;
+		} else {
+			return connection.messages.size();
+		}
 	}
 
-	public void setSynchronous(boolean synchronous) {
-		this.synchronous = synchronous;
+	public void increment(final String metricName, final Number value, final long time, final long count) {
+		if (agentOptions.getEnabled()) {
+			connection.send(new Metric(Metric.Type.INCREMENT, metricName, value, time, count).toString(), agentOptions.getSynchronous());
+		}
 	}
-
 
 	public void increment(final String metricName, final Number value, final long time) {
-		collector.send(new Metric(Metric.Type.INCREMENT, metricName, value, time), synchronous);
+		increment(metricName, value, time, 1);
 	}
 
 	public void increment(final String metricName, long time) {
@@ -68,8 +76,14 @@ public class Agent {
 		increment(metricName, System.currentTimeMillis());
 	}
 
+	public void gauge(final String metricName, final Number value, final long time, final long count) {
+		if (agentOptions.getEnabled()) {
+			connection.send(new Metric(Metric.Type.GAUGE, metricName, value, time, count).toString(), agentOptions.getSynchronous());
+		}
+	}
+
 	public void gauge(final String metricName, final Number value, final long time) {
-		collector.send(new Metric(Metric.Type.GAUGE, metricName, value, time), synchronous);
+		gauge(metricName, value, time, 1);
 	}
 
 	public void gauge(final String metricName, final Number value) {
@@ -149,11 +163,21 @@ public class Agent {
 		}, result);
 	}
 
-	public void notice(final String message, long duration, final long time) {
-		collector.send(new Metric(Metric.Type.NOTICE, message, duration, time), synchronous);
+	public void notice(final String message, final long time, final long duration) {
+		if (agentOptions.getEnabled()) {
+			connection.send(new Notice(message, time, duration).toString(), agentOptions.getSynchronous());
+		}
 	}
 
-	public void notice(final String message, long duration) {
-		notice(message, duration, System.currentTimeMillis());
+	public void notice(final String message, long time) {
+		notice(message, time, 0);
+	}
+
+	public void notice(final String message) {
+		notice(message, System.currentTimeMillis(), 0);
+	}
+
+	public boolean isQueueOverflowing() {
+		return connection.isQueueOverflowing();
 	}
 }
